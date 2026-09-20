@@ -3,27 +3,51 @@ import cors from "cors";
 import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { CHARACTERS, MOODS, pickCharacter, publicCharacter } from "./characters.js";
+import { loadBriefing } from "./news.js";
+import { ANCHOR, characterPrompt, scenePrompt } from "./prompts.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = Number(process.env.PORT || 8787);
 const BASE = process.env.POPVID_BASE_URL || "https://popvid.ai/api/public/v1";
 const KEY = process.env.POPVID_API_KEY;
+const SEED_BASE = (process.env.SEED_BASE_URL || "").replace(/\/$/, "");
+const SEED_IMAGE_URL = (process.env.SEED_IMAGE_URL || "").trim();
+const PUBLIC_BASE = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
+const ANCHOR_ASSET = "/anchor.jpg";
+const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT_SESSIONS || 3);
+const CONNECT_LIMIT = Number(process.env.CONNECT_LIMIT_PER_IP || 12);
+const CONNECT_WINDOW_MS = 15 * 60 * 1000;
+const HARD_CLOSE_MS = 300_000;
+
+const sessions = new Map();
+const connectHits = new Map();
 
 if (!KEY) {
-  console.warn("Missing POPVID_API_KEY — matching will fail until it is set");
+  console.warn("Missing POPVID_API_KEY — broadcast will fall back to teleprompter");
 }
 
 app.set("trust proxy", true);
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: "32kb" }));
+app.use(express.static(path.join(__dirname, "..", "public")));
 
-const sessions = new Map();
-const connectHits = new Map();
-const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT_SESSIONS || 3);
-const CONNECT_LIMIT = Number(process.env.CONNECT_LIMIT_PER_IP || 8);
-const CONNECT_WINDOW_MS = 15 * 60 * 1000;
+function publicOrigin(req) {
+  if (PUBLIC_BASE) return PUBLIC_BASE;
+  const xfProto = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim();
+  const xfHost = String(req?.headers?.["x-forwarded-host"] || "").split(",")[0].trim();
+  const host = xfHost || req?.headers?.host || "";
+  const proto = xfProto || (req?.protocol === "https" || req?.secure ? "https" : "http");
+  if (!host || /localhost|127\.0\.0\.1/i.test(host)) return "";
+  return `${proto}://${host}`;
+}
+
+function seedUrl(req) {
+  if (SEED_IMAGE_URL) return SEED_IMAGE_URL;
+  if (SEED_BASE) return `${SEED_BASE}/anchor.jpg`;
+  const origin = publicOrigin(req);
+  return origin ? `${origin}${ANCHOR_ASSET}` : null;
+}
 
 function clientIp(req) {
   return (
@@ -50,23 +74,26 @@ function authHeaders() {
   };
 }
 
-async function createPopvidSession(character, { dropSeed = false } = {}) {
+async function createPopvidSession({ briefing, dropSeed = false, req = null }) {
   const body = {
     model: "r2-realtime-v1",
     character: {
-      name: character.name,
-      prompt: character.prompt,
+      name: ANCHOR.name,
+      prompt: characterPrompt(),
     },
-    scene: { prompt: character.scene },
+    scene: { prompt: scenePrompt() },
     language: "en",
-    limits: { max_turns: 200, turn_rate_per_min: 20 },
+    limits: { max_duration_ms: 300_000, max_turns: 80, turn_rate_per_min: 30 },
     credentials_ttl_ms: 600_000,
     metadata: {
-      product: "nite",
-      character_id: character.id,
+      product: "wire24",
+      edition: briefing.edition,
+      generated_at: String(briefing.generated_at),
     },
   };
-  if (!dropSeed) body.seed_image_url = character.seed;
+  const url = dropSeed ? null : seedUrl(req);
+  if (url) body.seed_image_url = url;
+  console.log("[broadcast] seed", url || "(none)");
 
   const res = await fetch(`${BASE}/connections`, {
     method: "POST",
@@ -77,137 +104,205 @@ async function createPopvidSession(character, { dropSeed = false } = {}) {
   return { ok: res.ok, status: res.status, data };
 }
 
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, product: "nite" });
-});
-
-app.get("/api/roster", (_req, res) => {
-  res.json({
-    moods: MOODS,
-    online: 1800 + Math.floor(Math.random() * 900),
-    characters: CHARACTERS.map(publicCharacter),
-  });
-});
-
-app.post("/api/connect", async (req, res) => {
-  const ip = clientIp(req);
-  if (sessions.size >= MAX_CONCURRENT) {
-    return res.status(429).json({
-      error: {
-        code: "busy",
-        message: "Someone else is on a call. Try again in a moment.",
-        status: 429,
-        retry_after_ms: 8000,
-      },
-    });
-  }
-  if (!allowConnect(ip)) {
-    return res.status(429).json({
-      error: {
-        code: "rate_limited",
-        message: "Too many matches from this device. Give it a few minutes.",
-        status: 429,
-        retry_after_ms: 60000,
-      },
-    });
-  }
-
-  if (!KEY) {
-    return res.status(503).json({
-      error: {
-        code: "misconfigured",
-        message: "Server is missing POPVID_API_KEY",
-        status: 503,
-      },
-    });
-  }
-
-  const { characterId, mood, exclude } = req.body || {};
-  const character = pickCharacter({
-    characterId,
-    mood,
-    exclude: Array.isArray(exclude) ? exclude : [],
-  });
-  console.log("[connect] start", {
-    characterId: character.id,
-    mood: mood || null,
-    exclude: exclude || [],
-  });
-
-  let result;
-  try {
-    result = await createPopvidSession(character);
-  } catch (err) {
-    console.error("[connect] popvid fetch threw", err);
-    return res.status(502).json({
-      error: {
-        code: "upstream_unreachable",
-        message: `Can't reach PopVid: ${err.message}`,
-        status: 502,
-      },
-    });
-  }
-  if (!result.ok && result.status === 422 && !result.data?.error?.code) {
-    result = await createPopvidSession(character, { dropSeed: true });
-  }
-  if (!result.ok && result.data?.error?.code === "content_rejected") {
-    result = await createPopvidSession(character, { dropSeed: true });
-  }
-
-  if (!result.ok) {
-    const err = result.data?.error || {
-      code: "upstream",
-      message: "Couldn't connect",
-      status: result.status,
-    };
-    console.error("[connect] popvid rejected", result.status, err);
-    return res.status(result.status || 502).json({ error: err });
-  }
-
-  console.log("[connect] ok", result.data.session?.session_id, character.id);
-
-  const { session, credentials } = result.data;
-  if (!session?.session_id || !credentials) {
-    return res.status(502).json({
-      error: { code: "bad_payload", message: "Incomplete session payload" },
-    });
-  }
-
-  sessions.set(session.session_id, {
-    characterId: character.id,
-    createdAt: Date.now(),
-  });
-
-  res.status(201).json({
-    credentials,
-    session: {
-      session_id: session.session_id,
-      reservation_expires_at_ms: session.reservation_expires_at_ms,
-      media: session.media,
-    },
-    character: publicCharacter(character),
-  });
-});
-
 async function closeRemote(sessionId) {
+  const row = sessions.get(sessionId);
+  if (row?.timer) clearTimeout(row.timer);
+  sessions.delete(sessionId);
+  if (!KEY || !sessionId) return { ok: true, status: 200, data: { ok: true } };
   const res = await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}`, {
     method: "DELETE",
     headers: authHeaders(),
   });
   const data = await res.json().catch(() => ({}));
-  sessions.delete(sessionId);
   return { ok: res.ok || res.status === 404, status: res.status, data };
 }
 
+function trackSession({ sessionId, ip }) {
+  const timer = setTimeout(() => {
+    closeRemote(sessionId).catch(() => {});
+  }, HARD_CLOSE_MS);
+  sessions.set(sessionId, {
+    ip,
+    createdAt: Date.now(),
+    lastLease: Date.now(),
+    timer,
+  });
+}
+
+function publicItem(item) {
+  return {
+    id: item.id,
+    kind: item.kind || "story",
+    category: item.category,
+    category_label: item.category_label,
+    title: item.title,
+    summary: item.summary,
+    source: item.source,
+    ago: item.ago,
+    cue: item.cue,
+    story_ids: item.story_ids || [item.id],
+  };
+}
+
+function publicBriefing(briefing) {
+  return {
+    generated_at: briefing.generated_at,
+    edition: briefing.edition,
+    stale: briefing.stale,
+    sources: briefing.sources,
+    items: (briefing.items || []).map(publicItem),
+    cues: (briefing.cues || briefing.items || []).map(publicItem),
+    filler: briefing.filler ? publicItem(briefing.filler) : null,
+    closing: briefing.closing ? publicItem(briefing.closing) : null,
+  };
+}
+
+app.get("/api/health", (_req, res) => {
+  res.json({
+    ok: true,
+    product: "wire24",
+    title: "WIRE 24",
+    realtime: Boolean(KEY),
+    sessions: sessions.size,
+    seed: Boolean(SEED_IMAGE_URL || SEED_BASE || PUBLIC_BASE),
+  });
+});
+
+app.get("/api/briefing", async (req, res) => {
+  try {
+    const briefing = await loadBriefing({ force: String(req.query?.force || "") === "1" });
+    res.json(publicBriefing(briefing));
+  } catch (err) {
+    res.status(502).json({
+      error: { code: "briefing_failed", message: err.message || "News wires are unavailable." },
+    });
+  }
+});
+
+app.post("/api/broadcast", async (req, res) => {
+  const ip = clientIp(req);
+  let briefing;
+  try {
+    briefing = await loadBriefing();
+  } catch (err) {
+    return res.status(502).json({
+      mode: "text",
+      error: { code: "briefing_failed", message: err.message || "News wires are unavailable." },
+    });
+  }
+
+  const payload = {
+    mode: "text",
+    character: ANCHOR,
+    briefing: publicBriefing(briefing),
+  };
+
+  if (req.body?.prefer_text || !KEY) {
+    return res.json({
+      ...payload,
+      reason: KEY ? "prefer_text" : "misconfigured",
+      message: KEY ? "Switched to teleprompter mode." : "No API key configured. Running in teleprompter mode.",
+    });
+  }
+
+  if (sessions.size >= MAX_CONCURRENT) {
+    return res.status(429).json({
+      ...payload,
+      error: {
+        code: "busy",
+        message: "The studio is at capacity. Playing the teleprompter feed instead.",
+        retry_after_ms: 8000,
+      },
+    });
+  }
+
+  if (!allowConnect(ip)) {
+    return res.status(429).json({
+      ...payload,
+      error: {
+        code: "rate_limited",
+        message: "Too many joins from this network. Try again in a minute.",
+        retry_after_ms: 60_000,
+      },
+    });
+  }
+
+  let result;
+  try {
+    result = await createPopvidSession({ briefing, req });
+    for (let attempt = 0; attempt < 3 && !result.ok && result.data?.error?.code === "no_capacity"; attempt += 1) {
+      const wait = Number(result.data?.error?.retry_after_ms || 5000);
+      await new Promise((resolve) => setTimeout(resolve, wait));
+      result = await createPopvidSession({ briefing, req });
+    }
+  } catch (err) {
+    console.error("[broadcast] fetch threw", err);
+    return res.status(502).json({
+      ...payload,
+      error: { code: "upstream_unreachable", message: `Studio unreachable: ${err.message}` },
+    });
+  }
+
+  if (
+    !result.ok &&
+    result.data?.error?.code !== "no_capacity" &&
+    result.data?.error?.code !== "unauthorized"
+  ) {
+    result = await createPopvidSession({ briefing, dropSeed: true, req });
+  }
+
+  if (!result.ok) {
+    const raw = result.data?.error || {};
+    const err = {
+      code: raw.code || "upstream",
+      message:
+        raw.code === "no_capacity"
+          ? "Studio lines are busy. Playing the teleprompter feed and retrying the next hour."
+          : raw.message || "The live studio is unavailable. Playing the teleprompter feed.",
+      status: result.status,
+    };
+    console.error("[broadcast] rejected", result.status, err);
+    return res.status(result.status || 502).json({ ...payload, error: err });
+  }
+
+  const { session, credentials } = result.data;
+  if (!session?.session_id || !credentials) {
+    return res.status(502).json({
+      ...payload,
+      error: { code: "bad_payload", message: "The live session was incomplete. Playing the teleprompter feed." },
+    });
+  }
+
+  trackSession({ sessionId: session.session_id, ip });
+
+  res.status(201).json({
+    mode: "realtime",
+    credentials,
+    session: {
+      session_id: session.session_id,
+      reservation_expires_at_ms: session.reservation_expires_at_ms,
+      media: session.media,
+      hard_close_ms: HARD_CLOSE_MS,
+    },
+    character: ANCHOR,
+    briefing: publicBriefing(briefing),
+  });
+});
+
+app.post("/api/sessions/:id/heartbeat", (req, res) => {
+  const row = sessions.get(req.params.id);
+  if (!row) return res.status(404).json({ ok: false });
+  row.lastLease = Date.now();
+  res.json({ ok: true });
+});
+
 app.delete("/api/sessions/:id", async (req, res) => {
-  const { id } = req.params;
-  const result = await closeRemote(id);
+  const result = await closeRemote(req.params.id);
   res.status(result.ok ? 200 : result.status).json(result.data || { ok: true });
 });
 
 app.post("/api/sessions/:id/close", async (req, res) => {
-  const { id } = req.params;
-  await closeRemote(id);
+  await closeRemote(req.params.id);
   res.json({ ok: true });
 });
 
@@ -223,13 +318,15 @@ export default app;
 
 if (!process.env.VERCEL) {
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`NITE server on http://0.0.0.0:${PORT}`);
+    console.log(`WIRE 24 on http://0.0.0.0:${PORT}`);
   });
 
   setInterval(() => {
-    const cutoff = Date.now() - 6 * 60 * 1000;
+    const cutoff = Date.now() - 25_000;
     for (const [id, row] of sessions) {
-      if (row.createdAt < cutoff) sessions.delete(id);
+      if (row.lastLease < cutoff || Date.now() - row.createdAt > HARD_CLOSE_MS + 5_000) {
+        closeRemote(id).catch(() => {});
+      }
     }
-  }, 30_000);
+  }, 5_000);
 }

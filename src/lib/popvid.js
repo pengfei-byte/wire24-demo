@@ -29,6 +29,8 @@ export class PopvidClient {
     this.mediaConnectedSent = false;
     this.clientSeq = 0;
     this.reconnectTimer = null;
+    this.reconnectAttempt = 0;
+    this.droppedAt = 0;
   }
 
   send(type, data = {}) {
@@ -64,6 +66,8 @@ export class PopvidClient {
     this.ws = ws;
 
     ws.onopen = () => {
+      this.reconnectAttempt = 0;
+      this.droppedAt = 0;
       if (!this.ready) this.send("session.start", {});
     };
 
@@ -84,7 +88,12 @@ export class PopvidClient {
 
     ws.onclose = (ev) => {
       if (this.closed) return;
-      if (ev.code === 1000) return;
+      if (ev.code === 1000 || ev.code === 4401 || ev.code === 4403 || ev.code === 4409) {
+        this.closed = true;
+        this.onEnded?.({ reason: `ws_${ev.code}` });
+        this.teardown();
+        return;
+      }
       this.scheduleReconnect();
     };
 
@@ -93,10 +102,19 @@ export class PopvidClient {
 
   scheduleReconnect() {
     if (this.closed || this.reconnectTimer) return;
+    if (!this.droppedAt) this.droppedAt = Date.now();
+    if (Date.now() - this.droppedAt > 10_000) {
+      this.closed = true;
+      this.onEnded?.({ reason: "resume_window" });
+      this.teardown();
+      return;
+    }
+    const delay = [500, 1000, 2000][Math.min(this.reconnectAttempt, 2)];
+    this.reconnectAttempt += 1;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       if (!this.closed) this.connectSocket();
-    }, 400);
+    }, delay);
   }
 
   async handle(msg) {
@@ -104,6 +122,8 @@ export class PopvidClient {
     switch (msg.type) {
       case "session.ready":
         this.ready = true;
+        this.reconnectAttempt = 0;
+        this.droppedAt = 0;
         await this.negotiate();
         break;
       case "media.answer":

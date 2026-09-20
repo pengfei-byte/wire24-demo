@@ -1,5 +1,5 @@
 {
-  "name": "nite",
+  "name": "wire24",
   "private": true,
   "version": "1.0.0",
   "type": "module",
@@ -7,7 +7,8 @@
     "dev": "concurrently -k -n server,web -c cyan,magenta \"node --watch server/index.js\" \"vite\"",
     "build": "vite build",
     "start": "NODE_ENV=production node server/index.js",
-    "start:demo": "npm run build && NODE_ENV=production PORT=8790 node server/index.js"
+    "start:demo": "npm run build && NODE_ENV=production PORT=8790 node server/index.js",
+    "test": "node --test server/news.test.js"
   },
   "engines": {
     "node": ">=20"
