@@ -417,6 +417,75 @@ button:focus-visible { outline: 2px solid var(--gold); outline-offset: 3px; }
 }
 .go-live { background: var(--live); color: #fff; }
 .leave { background: transparent; border: 1px solid var(--line); color: var(--text); }
+.call-in {
+  width: 100%;
+  min-height: 48px;
+  margin-bottom: 8px;
+  border: 0;
+  background: var(--gold);
+  color: #1a1408;
+  font-family: var(--cond);
+  font-size: 18px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+.call-in:disabled { opacity: 0.55; }
+.line-anim {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: rgba(5, 8, 14, 0.72);
+  color: #fff;
+}
+.line-anim strong {
+  font-family: var(--cond);
+  letter-spacing: 0.2em;
+  font-size: 28px;
+  text-transform: uppercase;
+}
+.line-anim em {
+  font-style: normal;
+  font-family: var(--mono, ui-monospace, monospace);
+  letter-spacing: 0.14em;
+  color: var(--gold);
+}
+.line-box, .line-note {
+  margin-top: 10px;
+}
+.line-box span, .line-note {
+  color: var(--gold);
+  font-family: var(--cond);
+  letter-spacing: 0.12em;
+  font-size: 13px;
+  text-transform: uppercase;
+}
+.line-box p {
+  margin: 6px 0;
+  max-height: none;
+}
+.line-box div { display: flex; gap: 8px; }
+.line-box input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--line);
+  background: #0c1018;
+  color: var(--text);
+  padding: 8px 10px;
+}
+.line-box button {
+  border: 0;
+  background: var(--live);
+  color: #fff;
+  padding: 0 14px;
+  font-family: var(--cond);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
 .budget, .err, .fine { font-size: 12px; line-height: 1.5; }
 .budget { color: var(--gold); }
 .err { color: #ff8d8d; }

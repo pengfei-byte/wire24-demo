@@ -315,13 +315,13 @@ Live. Dead air forbidden. First word now. No questions. No wait. No re-greeting.
 ${body}`.trim();
 }
 
-function renderCue(story, first) {
-  const open = first ? "You're watching WIRE 24. I'm Elena Voss. " : "";
+function renderCue(story) {
   return directorWrap(`
-Read the script below in full, every sentence, in one continuous take. Do not shorten it and do not stop after the headline.
-After the script, add two sentences of commentary on why it matters. Use only the facts written here. Do not invent numbers, quotes, or events.
+Say the REPORT first, out loud, almost word for word. Do not skip it and do not open with your opinion.
+Then add only one or two sentences of commentary on why it matters. The commentary must be shorter than the report. No new numbers, quotes, or events.
 
-${open}${story.title}. ${story.summary} That report is from ${story.source}, ${story.ago}.
+REPORT:
+${story.title}. ${story.summary} That is the report from ${story.source}, ${story.ago}.
 `);
 }
 
@@ -343,13 +343,13 @@ function cueRecord(story, index, cue) {
 export function buildCues(stories) {
   if (!stories.length) return [];
   return stories.map((story, index) => {
-    let cue = renderCue(story, index === 0);
+    let cue = renderCue(story);
     if (cue.length > MAX_CUE_CHARS) {
       const trimmed = {
         ...story,
         summary: story.summary.slice(0, 180).replace(/\s+\S*$/, ""),
       };
-      cue = renderCue(trimmed, index === 0).slice(0, MAX_CUE_CHARS);
+      cue = renderCue(trimmed).slice(0, MAX_CUE_CHARS);
     }
     return cueRecord(story, index + 1, cue);
   });

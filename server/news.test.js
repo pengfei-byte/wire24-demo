@@ -76,6 +76,8 @@ test("cues pack stories and stay inside turn.submit length", () => {
     assert.ok(cue.cue.length <= MAX_CUE_CHARS);
   }
   assert.match(briefing.cues[0].cue, /Headline 1/);
-  assert.match(briefing.cues[0].cue, /commentary/i);
+  assert.match(briefing.cues[0].cue, /REPORT:/);
+  assert.ok(briefing.cues[0].cue.indexOf("REPORT:") < briefing.cues[0].cue.indexOf("Headline 1"));
+  assert.match(briefing.cues[0].cue, /one or two sentences of commentary/i);
   assert.match(briefing.cues[1].cue, /Headline 2/);
 });

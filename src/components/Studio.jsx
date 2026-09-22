@@ -8,6 +8,8 @@ const REJOIN_MS = 250;
 const NEWS_POLL_MS = 45_000;
 const TURN_STALL_MS = 22_000;
 const PIPELINE_MS = 2600;
+const LINE_RING_MS = 5_000;
+const LISTEN_MS = 25_000;
 
 function viewerMessage(text) {
   const clean = String(text || "")
@@ -31,6 +33,66 @@ function handoffAfterVisibleMs(text) {
   const chars = String(text || "").trim().length;
   const playback = Math.max(4500, Math.round((chars / 12) * 1000));
   return Math.max(1800, playback - PIPELINE_MS);
+}
+
+function introItem() {
+  return {
+    id: "intro",
+    kind: "intro",
+    category: "politics",
+    category_label: "WIRE 24",
+    title: "You're watching WIRE 24",
+    summary: "Elena Voss with politics, business, markets, and entertainment.",
+    source: "WIRE 24",
+    ago: "now",
+    story_ids: [],
+    cue: `[DIRECTOR — silent]
+Live. Read this welcome once, then stop. Do not start a news story. Do not add commentary.
+
+Good evening. You're watching WIRE 24. I'm Elena Voss. This hour we stay with politics, business, markets, and entertainment, and we bring you each story as the wires come in.`,
+  };
+}
+
+function inviteItem(story) {
+  const title = story?.title || "the story on the desk";
+  const summary = story?.summary || "";
+  return {
+    id: `line_${crypto.randomUUID()}`,
+    kind: "line",
+    category: story?.category || "politics",
+    category_label: "Call in",
+    title: "Viewer on the line",
+    summary: title,
+    source: "WIRE 24",
+    ago: "now",
+    story_ids: story?.story_ids || [],
+    cue: `[DIRECTOR — silent]
+A viewer just joined. Welcome them in two sentences. Name the story and invite one comment on it. Ask that one question, then stop and wait. Do not answer for them. Do not start another story.
+
+Story: ${title}. ${summary}`.slice(0, 2000),
+  };
+}
+
+function replyItem(story, words) {
+  const title = story?.title || "the story on the desk";
+  const summary = story?.summary || "";
+  const said = String(words || "").replace(/\s+/g, " ").trim().slice(0, 500);
+  return {
+    id: `reply_${crypto.randomUUID()}`,
+    kind: "line",
+    category: story?.category || "politics",
+    category_label: "Call in",
+    title: "Back to the story",
+    summary: said,
+    source: "WIRE 24",
+    ago: "now",
+    story_ids: story?.story_ids || [],
+    cue: `[DIRECTOR — silent]
+The viewer used their one comment. Answer them in two or three sentences about this story. Use their words. Do not ask another question. Do not invite them to speak again. Then stop.
+
+Story: ${title}. ${summary}
+Viewer said: "${said}"`.slice(0, 2000),
+  };
 }
 
 function speakingQueue(briefing) {
@@ -97,6 +159,14 @@ export default function Studio() {
   const archiveRef = useRef([]);
   const connectTimerRef = useRef(null);
   const showFailRef = useRef(() => {});
+  const holdNewsRef = useRef(false);
+  const lineRef = useRef("");
+  const onLineIdleRef = useRef(() => {});
+  const lineTimerRef = useRef(null);
+  const ringTickRef = useRef(null);
+  const micRef = useRef(null);
+  const spokeRef = useRef(false);
+  const storyAtLineRef = useRef(null);
 
   const [clock, setClock] = useState(() => formatClock(new Date()));
   const [health, setHealth] = useState(null);
@@ -107,6 +177,10 @@ export default function Studio() {
   const [fail, setFail] = useState(null);
   const [budget, setBudget] = useState(null);
   const [live, setLive] = useState(false);
+  const [lineMode, setLineMode] = useState("");
+  const [ringSec, setRingSec] = useState(5);
+  const [heard, setHeard] = useState("");
+  const [draft, setDraft] = useState("");
 
   const items = briefing?.items || [];
   const stories = storiesOnly(items);
@@ -140,14 +214,27 @@ export default function Studio() {
     mediaReadyRef.current = false;
     aheadRef.current = false;
     liveRef.current = false;
+    holdNewsRef.current = false;
+    lineRef.current = "";
+    spokeRef.current = false;
+    clearTimeout(lineTimerRef.current);
+    clearInterval(ringTickRef.current);
+    const rec = micRef.current;
+    micRef.current = null;
+    if (rec) {
+      rec.onresult = null;
+      rec.onerror = null;
+      try { rec.stop(); } catch { /* already stopped */ }
+    }
     setLive(false);
+    setLineMode("");
   }, []);
 
   const loadQueue = useCallback((data) => {
     briefingRef.current = data;
     fillerRef.current = data?.filler || null;
     const queue = speakingQueue(data);
-    cuesRef.current = queue;
+    cuesRef.current = [introItem(), ...queue];
     archiveRef.current = queue.slice();
     indexRef.current = 0;
     aheadRef.current = false;
@@ -216,7 +303,7 @@ export default function Studio() {
 
   const submitNext = useCallback(() => {
     const client = clientRef.current;
-    if (!client || aheadRef.current) return;
+    if (!client || aheadRef.current || holdNewsRef.current) return;
     clearTimeout(prefetchTimerRef.current);
     prefetchTimerRef.current = null;
     if (cuesRef.current.length - indexRef.current <= 1) refillQueue();
@@ -248,7 +335,8 @@ export default function Studio() {
     clearTimeout(turnTimerRef.current);
     turnTimerRef.current = setTimeout(() => {
       aheadRef.current = false;
-      submitNextRef.current();
+      if (holdNewsRef.current) onLineIdleRef.current();
+      else submitNextRef.current();
     }, TURN_STALL_MS);
   }, [refillQueue]);
 
@@ -304,6 +392,10 @@ export default function Studio() {
             aheadRef.current = false;
             const item = turnItemsRef.current.get(d.turn_id);
             if (item) parkOnAir(item);
+            if (holdNewsRef.current) {
+              setStatus(lineRef.current === "reply" ? "Answering the caller" : "On the line");
+              return;
+            }
             setStatus(item ? `On air · ${item.category_label}` : "Picture locked");
             const spoken = repliesRef.current.get(d.turn_id) || item?.cue || "";
             clearTimeout(prefetchTimerRef.current);
@@ -318,6 +410,10 @@ export default function Studio() {
           if (msg.type === "media.clip" && d.kind === "idle") {
             if (!startedRef.current) {
               tryStartTalking();
+              return;
+            }
+            if (holdNewsRef.current) {
+              if (!aheadRef.current) onLineIdleRef.current();
               return;
             }
             if (aheadRef.current) return;
@@ -453,6 +549,138 @@ export default function Studio() {
     };
   }, [shutdown]);
 
+  const stopMic = () => {
+    const rec = micRef.current;
+    micRef.current = null;
+    if (!rec) return;
+    rec.onresult = null;
+    rec.onerror = null;
+    rec.onend = null;
+    try {
+      rec.stop();
+    } catch {
+      /* already stopped */
+    }
+  };
+
+  const sayAside = (item) => {
+    const client = clientRef.current;
+    if (!client || !item?.cue) return;
+    clearTimeout(prefetchTimerRef.current);
+    prefetchTimerRef.current = null;
+    clearTimeout(turnTimerRef.current);
+    aheadRef.current = true;
+    const turnId = client.say(item.cue);
+    turnItemsRef.current.set(turnId, item);
+    parkOnAir(item);
+    turnTimerRef.current = setTimeout(() => {
+      aheadRef.current = false;
+      onLineIdleRef.current();
+    }, TURN_STALL_MS);
+  };
+
+  const endLine = () => {
+    if (!holdNewsRef.current) return;
+    stopMic();
+    clearTimeout(lineTimerRef.current);
+    holdNewsRef.current = false;
+    lineRef.current = "";
+    spokeRef.current = false;
+    storyAtLineRef.current = null;
+    setLineMode("");
+    setHeard("");
+    setDraft("");
+    aheadRef.current = false;
+    setStatus("Back to the wires");
+    submitNextRef.current();
+  };
+
+  const sendComment = (raw) => {
+    const text = String(raw || "").replace(/\s+/g, " ").trim();
+    if (!text || spokeRef.current || lineRef.current !== "listen") return;
+    spokeRef.current = true;
+    stopMic();
+    clearTimeout(lineTimerRef.current);
+    lineRef.current = "reply";
+    setLineMode("reply");
+    setHeard(text);
+    setStatus("Answering the caller");
+    sayAside(replyItem(storyAtLineRef.current, text));
+  };
+
+  const startMic = () => {
+    stopMic();
+    const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Rec) return;
+    const rec = new Rec();
+    rec.lang = navigator.language || "en-US";
+    rec.interimResults = true;
+    rec.continuous = false;
+    rec.onresult = (event) => {
+      let finalText = "";
+      let interim = "";
+      for (let i = 0; i < event.results.length; i += 1) {
+        const piece = event.results[i][0]?.transcript || "";
+        if (event.results[i].isFinal) finalText += piece;
+        else interim += piece;
+      }
+      const shown = (finalText || interim).trim();
+      if (shown) setHeard(shown);
+      if (finalText.trim()) sendComment(finalText);
+    };
+    try {
+      rec.start();
+      micRef.current = rec;
+    } catch {
+      /* mic already running */
+    }
+  };
+
+  onLineIdleRef.current = () => {
+    if (!holdNewsRef.current || aheadRef.current) return;
+    if (lineRef.current === "invite") {
+      lineRef.current = "listen";
+      setLineMode("listen");
+      setStatus("Mic open");
+      setHeard("");
+      startMic();
+      clearTimeout(lineTimerRef.current);
+      lineTimerRef.current = setTimeout(() => {
+        if (lineRef.current === "listen" && !spokeRef.current) endLine();
+      }, LISTEN_MS);
+      return;
+    }
+    if (lineRef.current === "reply") endLine();
+  };
+
+  const requestLine = () => {
+    if (!liveRef.current || lineRef.current) return;
+    lineRef.current = "ring";
+    setLineMode("ring");
+    setRingSec(5);
+    clearInterval(ringTickRef.current);
+    const startedAt = Date.now();
+    ringTickRef.current = setInterval(() => {
+      const left = Math.max(0, Math.ceil((LINE_RING_MS - (Date.now() - startedAt)) / 1000));
+      setRingSec(left);
+    }, 250);
+    clearTimeout(lineTimerRef.current);
+    lineTimerRef.current = setTimeout(() => {
+      clearInterval(ringTickRef.current);
+      if (lineRef.current !== "ring") return;
+      storyAtLineRef.current = onAirRef.current;
+      holdNewsRef.current = true;
+      lineRef.current = "invite";
+      spokeRef.current = false;
+      setLineMode("invite");
+      setHeard("");
+      setDraft("");
+      setStatus("On the line");
+      aheadRef.current = false;
+      sayAside(inviteItem(storyAtLineRef.current));
+    }, LINE_RING_MS);
+  };
+
   const leave = () => {
     continueRef.current = false;
     shutdown("client_closed");
@@ -518,6 +746,17 @@ export default function Studio() {
               <span />
             </div>
             <div className="tally">{phase === "onair" && live ? "ON AIR" : "CAM 1"}</div>
+            {lineMode === "ring" && (
+              <div className="line-anim" role="status" aria-live="polite">
+                <div className="pulse" aria-hidden="true">
+                  <span />
+                  <span />
+                  <span />
+                </div>
+                <strong>Call in</strong>
+                <em>{ringSec}s</em>
+              </div>
+            )}
             {onAir && (
               <div className={`lower ${onAir.category || ""}`}>
                 <em>{onAir.category_label}</em>
@@ -535,6 +774,29 @@ export default function Studio() {
                 : status}
             </span>
             <p>{onAir ? storyCaption(onAir) : "The anchor starts talking as soon as the picture is up. No typing required."}</p>
+            {lineMode === "listen" && (
+              <form
+                className="line-box"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  sendComment(draft || heard);
+                }}
+              >
+                <span>Mic open · one comment</span>
+                <p>{heard || "Listening…"}</p>
+                <div>
+                  <input
+                    value={draft}
+                    onChange={(event) => setDraft(event.target.value)}
+                    placeholder="Or type one comment"
+                    maxLength={400}
+                  />
+                  <button type="submit">Send</button>
+                </div>
+              </form>
+            )}
+            {lineMode === "reply" && <p className="line-note">She has your comment. One turn on this line.</p>}
+            {lineMode === "invite" && <p className="line-note">You're through. She'll ask you about the story on air.</p>}
           </div>
         </section>
 
@@ -558,6 +820,11 @@ export default function Studio() {
             {!stories.length && <li className="empty">Gathering wires…</li>}
           </ol>
           <div className="controls">
+            {live && (
+              <button type="button" className="call-in" disabled={Boolean(lineMode)} onClick={requestLine}>
+                {lineMode === "ring" ? "Connecting" : lineMode ? "On the line" : "Call in"}
+              </button>
+            )}
             {inStudio && (
               <button type="button" className="leave" onClick={leave}>
                 Leave
@@ -565,7 +832,7 @@ export default function Studio() {
             )}
             {remainingSec != null && phase === "onair" && <p className="budget">{remainingSec}s left this hour</p>}
             <p className="fine">
-              Headlines from BBC, NPR, The Guardian, and MarketWatch. Each item is expanded from the source, then given a short comment.
+              Headlines from BBC, NPR, The Guardian, and MarketWatch. She reads the report, then adds one or two sentences of comment.
             </p>
           </div>
         </aside>
