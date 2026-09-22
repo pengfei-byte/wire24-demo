@@ -1,5 +1,5 @@
 const FETCH_MS = 9000;
-const CACHE_MS = 90_000;
+const CACHE_MS = 40_000;
 const UA = "Wire24/1.0 (newsroom demo; +https://popvid.ai)";
 
 const SOURCES = [

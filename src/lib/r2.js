@@ -13,13 +13,14 @@ function iceGatheringComplete(pc, timeoutMs = 5000) {
   });
 }
 
-export class PopvidClient {
-  constructor({ credentials, remoteVideo, onEvent, onError, onEnded }) {
+export class R2Client {
+  constructor({ credentials, remoteVideo, onEvent, onError, onEnded, onRemoteStream }) {
     this.credentials = credentials;
     this.remoteVideo = remoteVideo;
     this.onEvent = onEvent;
     this.onError = onError;
     this.onEnded = onEnded;
+    this.onRemoteStream = onRemoteStream;
     this.lastEventId = null;
     this.seen = new Set();
     this.ws = null;
@@ -59,10 +60,7 @@ export class PopvidClient {
     const url = new URL(control_url);
     url.searchParams.set("session_id", session_id);
     if (this.lastEventId) url.searchParams.set("resume_from", this.lastEventId);
-    const ws = new WebSocket(url.toString(), [
-      "r2.v1",
-      `r2.token.${control_token}`,
-    ]);
+    const ws = new WebSocket(url.toString(), ["r2.v1", `r2.token.${control_token}`]);
     this.ws = ws;
 
     ws.onopen = () => {
@@ -166,11 +164,18 @@ export class PopvidClient {
     pc.addTransceiver("audio", { direction: "recvonly" });
 
     pc.ontrack = (e) => {
-      const stream = e.streams[0];
-      if (this.remoteVideo && stream) {
-        this.remoteVideo.srcObject = stream;
+      const inbound = e.streams[0] || new MediaStream([e.track]);
+      if (this.remoteVideo) {
+        let mixed = this.remoteVideo.srcObject;
+        if (!(mixed instanceof MediaStream)) {
+          mixed = inbound;
+          this.remoteVideo.srcObject = mixed;
+        } else if (e.track && !mixed.getTracks().some((track) => track.id === e.track.id)) {
+          mixed.addTrack(e.track);
+        }
         this.remoteVideo.play().catch(() => {});
       }
+      if (e.track?.kind === "audio") this.onRemoteStream?.(inbound, e.track);
     };
 
     pc.onconnectionstatechange = () => {

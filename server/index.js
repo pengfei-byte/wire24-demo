@@ -201,7 +201,7 @@ app.post("/api/broadcast", async (req, res) => {
     return res.json({
       ...payload,
       reason: KEY ? "prefer_text" : "misconfigured",
-      message: KEY ? "Switched to teleprompter mode." : "No API key configured. Running in teleprompter mode.",
+      message: KEY ? "The live picture is off. Try again." : "The live line is not ready. Try again shortly.",
     });
   }
 
@@ -210,7 +210,7 @@ app.post("/api/broadcast", async (req, res) => {
       ...payload,
       error: {
         code: "busy",
-        message: "The studio is at capacity. Playing the teleprompter feed instead.",
+        message: "The studio is full right now. Try again in a moment.",
         retry_after_ms: 8000,
       },
     });
@@ -257,8 +257,8 @@ app.post("/api/broadcast", async (req, res) => {
       code: raw.code || "upstream",
       message:
         raw.code === "no_capacity"
-          ? "Studio lines are busy. Playing the teleprompter feed and retrying the next hour."
-          : raw.message || "The live studio is unavailable. Playing the teleprompter feed.",
+          ? "The live line is busy right now. Try again in a moment."
+          : raw.message || "The live line didn't connect. Try again.",
       status: result.status,
     };
     console.error("[broadcast] rejected", result.status, err);
@@ -269,7 +269,7 @@ app.post("/api/broadcast", async (req, res) => {
   if (!session?.session_id || !credentials) {
     return res.status(502).json({
       ...payload,
-      error: { code: "bad_payload", message: "The live session was incomplete. Playing the teleprompter feed." },
+      error: { code: "bad_payload", message: "The live session did not start. Try again." },
     });
   }
 

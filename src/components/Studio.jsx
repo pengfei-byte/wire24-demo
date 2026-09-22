@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { PopvidClient } from "../lib/popvid.js";
+import { R2Client } from "../lib/r2.js";
 import { closeSession, fetchBriefing, fetchHealth, heartbeat, startBroadcast } from "../lib/api.js";
 
-const TEXT_DWELL_MS = 7_000;
+const CONNECT_TIMEOUT_MS = 20_000;
 const HIDDEN_CLOSE_MS = 25_000;
 const LOW_BUDGET_MS = 12_000;
 const REJOIN_MS = 250;
@@ -10,6 +10,19 @@ const PIPELINE_MS = 2800;
 const MIN_LEAD_MS = 1600;
 const TURN_SAFETY_PAD_MS = 12_000;
 const TURN_FALLBACK_MS = 90_000;
+const NEWS_POLL_MS = 45_000;
+
+function viewerMessage(text) {
+  const clean = String(text || "")
+    .replace(/pop\s*vid/gi, "Reverie")
+    .replace(/\s+/g, " ")
+    .trim();
+  return clean || "The live line didn't connect. Try again.";
+}
+
+function cueKey(cue) {
+  return cue?.title || cue?.id || "";
+}
 
 function prefetchDelayMs(estMs) {
   const est = Number(estMs) > 0 ? Number(estMs) : 22_000;
@@ -78,6 +91,9 @@ export default function Studio() {
   const refillingRef = useRef(false);
   const briefingRef = useRef(null);
   const closeSentRef = useRef(false);
+  const archiveRef = useRef([]);
+  const connectTimerRef = useRef(null);
+  const showFailRef = useRef(() => {});
 
   const [clock, setClock] = useState(() => formatClock(new Date()));
   const [health, setHealth] = useState(null);
@@ -86,7 +102,7 @@ export default function Studio() {
   const [status, setStatus] = useState("Standby");
   const [caption, setCaption] = useState("");
   const [currentId, setCurrentId] = useState(null);
-  const [error, setError] = useState("");
+  const [fail, setFail] = useState(null);
   const [budget, setBudget] = useState(null);
   const [live, setLive] = useState(false);
 
@@ -107,18 +123,13 @@ export default function Studio() {
     fetchHealth()
       .then(setHealth)
       .catch(() => setHealth({ realtime: false }));
-    fetchBriefing()
-      .then((data) => {
-        briefingRef.current = data;
-        setBriefing(data);
-      })
-      .catch((err) => setError(err.message));
   }, []);
 
   const clearTimers = () => {
     clearTimeout(turnTimerRef.current);
     clearTimeout(prefetchTimerRef.current);
     clearTimeout(textTimerRef.current);
+    clearTimeout(connectTimerRef.current);
   };
 
   const shutdown = useCallback((reason = "client_closed") => {
@@ -139,34 +150,66 @@ export default function Studio() {
     briefingRef.current = data;
     fillerRef.current = data?.filler || null;
     closingRef.current = data?.closing || null;
-    cuesRef.current = speakingQueue(data);
+    const queue = speakingQueue(data);
+    cuesRef.current = queue;
+    archiveRef.current = queue.slice();
     indexRef.current = 0;
     wrappingRef.current = false;
     closeSentRef.current = false;
+  }, []);
+
+  const absorbNews = useCallback((data) => {
+    if (!data) return;
+    briefingRef.current = data;
+    setBriefing(data);
+    if (data.filler) fillerRef.current = data.filler;
+    if (data.closing) closingRef.current = data.closing;
+    const incoming = speakingQueue(data);
+    if (incoming.length) {
+      const seen = new Set(incoming.map(cueKey));
+      const older = archiveRef.current.filter((cue) => cue?.cue && !seen.has(cueKey(cue)));
+      archiveRef.current = [...incoming, ...older].slice(0, 8);
+    }
+    if (!startedRef.current || !incoming.length) return;
+    const recent = new Set(
+      cuesRef.current.slice(Math.max(0, indexRef.current - 1), indexRef.current + 4).map(cueKey)
+    );
+    const fresh = incoming.filter((cue) => cue.cue && !recent.has(cueKey(cue)));
+    if (!fresh.length) return;
+    const freshKeys = new Set(fresh.map(cueKey));
+    const head = cuesRef.current.slice(0, indexRef.current);
+    const tail = cuesRef.current.slice(indexRef.current).filter((cue) => !freshKeys.has(cueKey(cue)));
+    cuesRef.current = [...head, ...fresh.map((cue) => cloneCue(cue, "new")), ...tail];
   }, []);
 
   const refillQueue = useCallback(async () => {
     if (refillingRef.current) return;
     refillingRef.current = true;
     try {
-      const next = await fetchBriefing(true);
-      briefingRef.current = { ...briefingRef.current, ...next, items: next.items };
-      setBriefing((prev) => ({
-        ...(prev || {}),
-        ...next,
-        items: next.items?.length ? next.items : prev?.items,
-      }));
-      const seen = new Set(cuesRef.current.map((item) => item.title));
-      const extra = speakingQueue(next).filter((item) => !seen.has(item.title));
-      if (extra.length) cuesRef.current = [...cuesRef.current, ...extra];
-      if (next.filler) fillerRef.current = next.filler;
-      if (next.closing) closingRef.current = next.closing;
+      absorbNews(await fetchBriefing(true));
     } catch {
-      /* keep current queue */
+      /* keep the copy already on air */
     } finally {
       refillingRef.current = false;
     }
-  }, []);
+  }, [absorbNews]);
+
+  useEffect(() => {
+    let stop = false;
+    const pull = (force = false) => {
+      fetchBriefing(force)
+        .then((data) => {
+          if (!stop) absorbNews(data);
+        })
+        .catch(() => {});
+    };
+    pull(true);
+    const timer = setInterval(() => pull(false), NEWS_POLL_MS);
+    return () => {
+      stop = true;
+      clearInterval(timer);
+    };
+  }, [absorbNews]);
 
   const submitNextRef = useRef(() => {});
   const advanceQueueRef = useRef(() => {});
@@ -211,19 +254,17 @@ export default function Studio() {
     if (!client || wrappingRef.current || inFlightRef.current) return;
     if (cuesRef.current.length - indexRef.current <= 1) refillQueue();
     if (indexRef.current >= cuesRef.current.length) {
-      const filler = cloneCue(fillerRef.current, "fill");
-      if (filler) cuesRef.current.push(filler);
-      else {
-        wrappingRef.current = true;
-        const close = cloneCue(closingRef.current, "close");
-        if (close) {
-          closeSentRef.current = true;
-          inFlightRef.current = true;
-          spokenRef.current = false;
-          setCurrentId(close.id);
-          client.say(close.cue);
-        }
-        return;
+      const source = archiveRef.current.length ? archiveRef.current : cuesRef.current;
+      const replay = source
+        .filter((item) => item && item.kind !== "close" && item.cue)
+        .map((item) => cloneCue(item, "again"));
+      if (replay.length) {
+        cuesRef.current = replay;
+        indexRef.current = 0;
+      } else {
+        const filler = cloneCue(fillerRef.current, "fill");
+        if (!filler) return;
+        cuesRef.current.push(filler);
       }
     }
     const item = cuesRef.current[indexRef.current];
@@ -256,33 +297,20 @@ export default function Studio() {
 
   const joinRef = useRef(null);
 
-  const runTextEdition = useCallback((nextBriefing) => {
-    shutdown("text_mode");
-    continueRef.current = true;
-    setPhase("text");
-    setStatus("Teleprompter");
-    loadQueue(nextBriefing);
-    const step = () => {
-      if (!continueRef.current) return;
-      if (indexRef.current >= cuesRef.current.length) {
-        const filler = cloneCue(fillerRef.current, "fill");
-        if (filler) cuesRef.current.push(filler);
-        else {
-          setStatus("Hour complete. Next edition…");
-          textTimerRef.current = setTimeout(() => joinRef.current?.(true), REJOIN_MS);
-          return;
-        }
-      }
-      const item = cuesRef.current[indexRef.current];
-      indexRef.current += 1;
-      setCurrentId(item.id);
-      setCaption(item.cue ? `${item.category_label} | ${item.title}. ${item.summary}` : item.title);
-      setStatus(item.kind === "close" ? "Closing" : `Reading · ${item.category_label}`);
-      if (cuesRef.current.length - indexRef.current <= 1) refillQueue();
-      textTimerRef.current = setTimeout(step, item.kind === "close" ? 5000 : TEXT_DWELL_MS);
-    };
-    step();
-  }, [loadQueue, refillQueue, shutdown]);
+  const showFail = useCallback((body) => {
+    continueRef.current = false;
+    clearTimeout(connectTimerRef.current);
+    shutdown("connect_failed");
+    setPhase("lobby");
+    setStatus("Standby");
+    setLive(false);
+    setFail({
+      title: "Couldn't go live",
+      body: viewerMessage(body),
+    });
+  }, [shutdown]);
+
+  showFailRef.current = showFail;
 
   const attachClient = useCallback(
     (data) => {
@@ -292,7 +320,7 @@ export default function Studio() {
       spokenRef.current = false;
       startedRef.current = false;
       mediaReadyRef.current = false;
-      const client = new PopvidClient({
+      const client = new R2Client({
         credentials: data.credentials,
         remoteVideo: videoRef.current,
         onEvent: (msg) => {
@@ -326,22 +354,23 @@ export default function Studio() {
           }
         },
         onError: (err) => {
-          setError(err.message || err.code || "Studio signal dropped");
+          if (!liveRef.current) showFailRef.current(err.message || err.code || "The live line dropped.");
         },
         onEnded: () => {
+          if (clientRef.current !== client) return;
           liveRef.current = false;
           setLive(false);
           if (joiningRef.current) return;
-          if (!startedRef.current && continueRef.current && cuesRef.current.length) {
-            runTextEdition(briefingRef.current || { cues: cuesRef.current });
+          if (continueRef.current && startedRef.current) {
+            setStatus("Next edition…");
+            setPhase("joining");
+            setTimeout(() => joinRef.current?.(true), REJOIN_MS);
             return;
           }
-          if (continueRef.current) {
-            setStatus("Next edition…");
-            setTimeout(() => joinRef.current?.(true), REJOIN_MS);
-          } else {
+          if (continueRef.current) showFailRef.current("The live line dropped before the picture came up.");
+          else {
             setPhase("lobby");
-            setStatus("Signal lost");
+            setStatus("Standby");
           }
         },
       });
@@ -350,7 +379,7 @@ export default function Studio() {
       setPhase("onair");
       setStatus("Connecting picture");
     },
-    [advanceQueue, armSpeechTimers, loadQueue, runTextEdition, submitNext, tryStartTalking]
+    [advanceQueue, armSpeechTimers, loadQueue, submitNext, tryStartTalking]
   );
 
   const join = useCallback(
@@ -362,57 +391,50 @@ export default function Studio() {
         reconnectsRef.current += 1;
         if (reconnectsRef.current > 4) {
           joiningRef.current = false;
-          continueRef.current = false;
-          setPhase("lobby");
-          setStatus("Hourly cap reached");
-          setError("Too many joins this hour. Click Watch live to try again.");
+          showFail("Too many reconnects this hour. Try again in a little while.");
           return;
         }
       }
       clearTimers();
       continueRef.current = true;
       shutdown(isReconnect ? "edition_rollover" : "restart");
-      setError("");
+      setFail(null);
       setCaption("");
       setCurrentId(null);
       setBudget(null);
       setPhase("joining");
-      setStatus(isReconnect ? "Next edition…" : "Entering the studio");
+      setStatus(isReconnect ? "Next edition…" : "Connecting");
+      startedRef.current = false;
       try {
         const data = await startBroadcast();
-        if (data.briefing) {
-          briefingRef.current = data.briefing;
-          setBriefing(data.briefing);
-        }
+        if (data.briefing) absorbNews(data.briefing);
         if (data.mode === "realtime" && data.credentials) {
           attachClient(data);
+          clearTimeout(connectTimerRef.current);
+          connectTimerRef.current = setTimeout(() => {
+            if (!liveRef.current) showFailRef.current("The picture didn't come up. Try again.");
+          }, CONNECT_TIMEOUT_MS);
         } else {
-          runTextEdition(data.briefing);
-          if (data.error?.message) setError(data.error.message);
-          else if (data.message) setError(data.message);
+          showFail(data.error?.message || data.message);
         }
       } catch (err) {
-        setError(err.message);
-        if (err.payload?.briefing) {
-          setBriefing(err.payload.briefing);
-          runTextEdition(err.payload.briefing);
-        } else {
-          continueRef.current = false;
-          setPhase("lobby");
-          setStatus("Join failed");
-        }
+        if (err.payload?.briefing) absorbNews(err.payload.briefing);
+        showFail(err.message);
       } finally {
         joiningRef.current = false;
       }
     },
-    [attachClient, runTextEdition, shutdown]
+    [absorbNews, attachClient, showFail, shutdown]
   );
 
   joinRef.current = join;
 
   useEffect(() => {
     liveRef.current = live;
-    if (live) tryStartTalking();
+    if (live) {
+      clearTimeout(connectTimerRef.current);
+      tryStartTalking();
+    }
   }, [live, tryStartTalking]);
 
   useEffect(() => {
@@ -464,12 +486,14 @@ export default function Studio() {
     setStatus("You left the studio");
     setCaption("");
     setCurrentId(null);
-    setError("");
+    setFail(null);
   };
 
   const tickerItems = stories.length ? [...stories, ...stories] : [];
   const remainingSec = budget ? Math.max(0, Math.round(budget.budget_remaining_ms / 1000)) : null;
-  const inStudio = phase === "joining" || phase === "onair" || phase === "text";
+  const inStudio = phase === "joining" || phase === "onair";
+  const showCover = !live || phase !== "onair";
+  const connecting = phase === "joining" || (phase === "onair" && !live);
 
   return (
     <div className="studio">
@@ -480,7 +504,7 @@ export default function Studio() {
         </div>
         <div className="mast-center">
           <span className={`live-pill ${phase === "onair" && live ? "on" : ""}`}>
-            <i /> {phase === "onair" && live ? "LIVE" : phase === "text" ? "TEXT" : "STANDBY"}
+            <i /> {phase === "onair" && live ? "LIVE" : connecting ? "CONNECTING" : "STANDBY"}
           </span>
           <span className="edition">{briefing?.edition || "Rolling news"}</span>
         </div>
@@ -494,11 +518,24 @@ export default function Studio() {
         <section className="camera">
           <div className="viewfinder">
             <video ref={videoRef} className="anchor-video" autoPlay playsInline />
-            {(!live || phase !== "onair") && (
-              <div className="poster" aria-hidden>
+            {showCover && (
+              <div className="poster">
                 <img src="/anchor.jpg" alt="Elena Voss, WIRE 24 anchor" />
-                {phase === "text" && <span className="poster-mode">TELEPROMPTER</span>}
-                {phase === "joining" && <span className="poster-mode">HOLDING FOR LINE</span>}
+                {phase === "lobby" && (
+                  <button type="button" className="cover-go" onClick={() => join(false)}>
+                    Watch live
+                  </button>
+                )}
+                {connecting && (
+                  <div className="cover-connect" role="status" aria-live="polite">
+                    <div className="pulse" aria-hidden="true">
+                      <span />
+                      <span />
+                      <span />
+                    </div>
+                    <strong>Connecting</strong>
+                  </div>
+                )}
               </div>
             )}
             <div className="finders">
@@ -527,7 +564,7 @@ export default function Studio() {
         <aside className="rundown">
           <div className="rundown-head">
             <p>This hour</p>
-            <span>{health?.realtime ? "PopVid line ready" : "Teleprompter backup"}</span>
+            <span>{health?.realtime ? "Desk ready" : "Desk updating"}</span>
           </div>
           <ol>
             {stories.map((item, idx) => (
@@ -544,17 +581,12 @@ export default function Studio() {
             {!stories.length && <li className="empty">Gathering wires…</li>}
           </ol>
           <div className="controls">
-            {!inStudio ? (
-              <button type="button" className="go-live" onClick={() => join(false)}>
-                Watch live
-              </button>
-            ) : (
+            {inStudio && (
               <button type="button" className="leave" onClick={leave}>
                 Leave
               </button>
             )}
             {remainingSec != null && phase === "onair" && <p className="budget">{remainingSec}s left this hour</p>}
-            {error && <p className="err">{error}</p>}
             <p className="fine">
               Headlines from BBC, NPR, The Guardian, and MarketWatch. The anchor reads title and summary only.
             </p>
@@ -576,6 +608,23 @@ export default function Studio() {
           </div>
         </div>
       </footer>
+      <p className="powered">Powered by Reverie R2 API</p>
+      {fail && (
+        <div className="fail-scrim" role="dialog" aria-modal="true" aria-labelledby="fail-title">
+          <div className="fail-card">
+            <h2 id="fail-title">{fail.title}</h2>
+            <p>{fail.body}</p>
+            <div className="fail-actions">
+              <button type="button" className="primary" onClick={() => join(false)}>
+                Try again
+              </button>
+              <button type="button" className="ghost" onClick={() => setFail(null)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
