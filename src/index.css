@@ -420,7 +420,7 @@ button:focus-visible { outline: 2px solid var(--gold); outline-offset: 3px; }
 .call-in {
   width: 100%;
   min-height: 48px;
-  margin-bottom: 8px;
+  margin: 8px 0 0;
   border: 0;
   background: var(--gold);
   color: #1a1408;

@@ -156,7 +156,6 @@ export default function Studio() {
   const fillerRef = useRef(null);
   const refillingRef = useRef(false);
   const briefingRef = useRef(null);
-  const archiveRef = useRef([]);
   const connectTimerRef = useRef(null);
   const showFailRef = useRef(() => {});
   const holdNewsRef = useRef(false);
@@ -235,7 +234,6 @@ export default function Studio() {
     fillerRef.current = data?.filler || null;
     const queue = speakingQueue(data);
     cuesRef.current = [introItem(), ...queue];
-    archiveRef.current = queue.slice();
     indexRef.current = 0;
     aheadRef.current = false;
     turnItemsRef.current = new Map();
@@ -248,21 +246,11 @@ export default function Studio() {
     setBriefing(data);
     if (data.filler) fillerRef.current = data.filler;
     const incoming = speakingQueue(data);
-    if (incoming.length) {
-      const seen = new Set(incoming.map(cueKey));
-      const older = archiveRef.current.filter((cue) => cue?.cue && !seen.has(cueKey(cue)));
-      archiveRef.current = [...incoming, ...older].slice(0, 8);
-    }
     if (!startedRef.current || !incoming.length) return;
-    const recent = new Set(
-      cuesRef.current.slice(Math.max(0, indexRef.current - 1), indexRef.current + 4).map(cueKey)
-    );
-    const fresh = incoming.filter((cue) => cue.cue && !recent.has(cueKey(cue)));
-    if (!fresh.length) return;
-    const freshKeys = new Set(fresh.map(cueKey));
-    const head = cuesRef.current.slice(0, indexRef.current);
-    const tail = cuesRef.current.slice(indexRef.current).filter((cue) => !freshKeys.has(cueKey(cue)));
-    cuesRef.current = [...head, ...fresh.map((cue) => cloneCue(cue, "new")), ...tail];
+    const queued = new Set(cuesRef.current.map(cueKey));
+    const extra = incoming.filter((cue) => cue?.cue && cue.kind !== "close" && !queued.has(cueKey(cue)));
+    if (!extra.length) return;
+    cuesRef.current = [...cuesRef.current, ...extra.map((cue) => cloneCue(cue, "new"))];
   }, []);
 
   const refillQueue = useCallback(async () => {
@@ -308,7 +296,7 @@ export default function Studio() {
     prefetchTimerRef.current = null;
     if (cuesRef.current.length - indexRef.current <= 1) refillQueue();
     if (indexRef.current >= cuesRef.current.length) {
-      const source = archiveRef.current.length ? archiveRef.current : cuesRef.current;
+      const source = speakingQueue(briefingRef.current);
       const replay = source
         .filter((item) => item && item.kind !== "close" && item.cue)
         .map((item) => cloneCue(item, "again"));
@@ -767,6 +755,11 @@ export default function Studio() {
               </div>
             )}
           </div>
+          {live && (
+            <button type="button" className="call-in" disabled={Boolean(lineMode)} onClick={requestLine}>
+              {lineMode === "ring" ? "Connecting" : lineMode ? "On the line" : "Call in"}
+            </button>
+          )}
           <div className="caption-rail">
             <span className="rail-kicker">
               {onAir && onAir.kind !== "close"
@@ -820,11 +813,6 @@ export default function Studio() {
             {!stories.length && <li className="empty">Gathering wires…</li>}
           </ol>
           <div className="controls">
-            {live && (
-              <button type="button" className="call-in" disabled={Boolean(lineMode)} onClick={requestLine}>
-                {lineMode === "ring" ? "Connecting" : lineMode ? "On the line" : "Call in"}
-              </button>
-            )}
             {inStudio && (
               <button type="button" className="leave" onClick={leave}>
                 Leave
