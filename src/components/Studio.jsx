@@ -4,11 +4,10 @@ import { closeSession, fetchBriefing, fetchHealth, heartbeat, startBroadcast } f
 
 const CONNECT_TIMEOUT_MS = 20_000;
 const HIDDEN_CLOSE_MS = 25_000;
-const LOW_BUDGET_MS = 12_000;
 const REJOIN_MS = 250;
-const PIPELINE_MS = 2800;
-const TURN_SAFETY_FLOOR_MS = 70_000;
 const NEWS_POLL_MS = 45_000;
+const TURN_STALL_MS = 22_000;
+const PIPELINE_MS = 2600;
 
 function viewerMessage(text) {
   const clean = String(text || "")
@@ -22,27 +21,16 @@ function cueKey(cue) {
   return cue?.title || cue?.id || "";
 }
 
-function handoffDelayMs(estMs) {
-  const est = Number(estMs);
-  if (!Number.isFinite(est) || est < 18_000) return null;
-  return Math.max(10_000, est - PIPELINE_MS);
-}
-
 function storyCaption(item) {
-  if (!item || item.kind === "close") return "That's the hour on WIRE 24. The wires are still moving.";
-  const summary = String(item.summary || "").trim();
+  const summary = String(item?.summary || "").trim();
+  if (!item?.title) return "";
   return summary ? `${item.title}. ${summary}` : item.title;
 }
 
-function continuationCue(item) {
-  return `[DIRECTOR — silent]
-Live. Dead air forbidden. First word now. No questions. No greeting.
-You stopped too early on this same story. Do not read the headline again.
-Finish it now in four or five sentences: the reported detail, then two sentences of commentary on why it matters. Use only the facts below. Do not invent numbers, quotes, or events.
-
-${item.title}
-${item.summary}
-(${item.source})`.slice(0, 2000);
+function handoffAfterVisibleMs(text) {
+  const chars = String(text || "").trim().length;
+  const playback = Math.max(4500, Math.round((chars / 12) * 1000));
+  return Math.max(1800, playback - PIPELINE_MS);
 }
 
 function speakingQueue(briefing) {
@@ -89,27 +77,23 @@ export default function Studio() {
   const sessionRef = useRef(null);
   const cuesRef = useRef([]);
   const indexRef = useRef(0);
-  const inFlightRef = useRef(false);
-  const spokenRef = useRef(false);
   const mediaReadyRef = useRef(false);
   const startedRef = useRef(false);
-  const wrappingRef = useRef(false);
+  const aheadRef = useRef(false);
   const continueRef = useRef(false);
   const joiningRef = useRef(false);
   const reconnectsRef = useRef(0);
   const turnTimerRef = useRef(null);
   const prefetchTimerRef = useRef(null);
   const onAirRef = useRef(null);
-  const continuesRef = useRef(0);
-  const lastTextLenRef = useRef(0);
+  const turnItemsRef = useRef(new Map());
+  const repliesRef = useRef(new Map());
   const hiddenTimerRef = useRef(null);
   const textTimerRef = useRef(null);
   const liveRef = useRef(false);
   const fillerRef = useRef(null);
-  const closingRef = useRef(null);
   const refillingRef = useRef(false);
   const briefingRef = useRef(null);
-  const closeSentRef = useRef(false);
   const archiveRef = useRef([]);
   const connectTimerRef = useRef(null);
   const showFailRef = useRef(() => {});
@@ -154,8 +138,7 @@ export default function Studio() {
     if (id) closeSession(id);
     sessionRef.current = null;
     mediaReadyRef.current = false;
-    inFlightRef.current = false;
-    spokenRef.current = false;
+    aheadRef.current = false;
     liveRef.current = false;
     setLive(false);
   }, []);
@@ -163,13 +146,13 @@ export default function Studio() {
   const loadQueue = useCallback((data) => {
     briefingRef.current = data;
     fillerRef.current = data?.filler || null;
-    closingRef.current = data?.closing || null;
     const queue = speakingQueue(data);
     cuesRef.current = queue;
     archiveRef.current = queue.slice();
     indexRef.current = 0;
-    wrappingRef.current = false;
-    closeSentRef.current = false;
+    aheadRef.current = false;
+    turnItemsRef.current = new Map();
+    repliesRef.current = new Map();
   }, []);
 
   const absorbNews = useCallback((data) => {
@@ -177,7 +160,6 @@ export default function Studio() {
     briefingRef.current = data;
     setBriefing(data);
     if (data.filler) fillerRef.current = data.filler;
-    if (data.closing) closingRef.current = data.closing;
     const incoming = speakingQueue(data);
     if (incoming.length) {
       const seen = new Set(incoming.map(cueKey));
@@ -226,55 +208,17 @@ export default function Studio() {
   }, [absorbNews]);
 
   const submitNextRef = useRef(() => {});
-  const advanceQueueRef = useRef(() => {});
 
   const parkOnAir = useCallback((item) => {
     onAirRef.current = item;
     setOnAir(item);
   }, []);
 
-  const armSpeechTimers = useCallback((estMs) => {
-    clearTimeout(prefetchTimerRef.current);
-    clearTimeout(turnTimerRef.current);
-    const handoff = handoffDelayMs(estMs);
-    if (handoff != null) {
-      prefetchTimerRef.current = setTimeout(() => {
-        advanceQueueRef.current();
-      }, handoff);
-    }
-    const est = Number(estMs);
-    const safety = Math.max(TURN_SAFETY_FLOOR_MS, (Number.isFinite(est) ? est : 0) + 8000);
-    turnTimerRef.current = setTimeout(() => {
-      advanceQueueRef.current(true);
-    }, safety);
-  }, []);
-
-  const advanceQueue = useCallback((force = false) => {
-    if (!clientRef.current) return;
-    if (!force && inFlightRef.current && !spokenRef.current) return;
-    inFlightRef.current = false;
-    spokenRef.current = false;
-    clearTimeout(turnTimerRef.current);
-    clearTimeout(prefetchTimerRef.current);
-    if (wrappingRef.current) {
-      if (!closeSentRef.current && closingRef.current && clientRef.current) {
-        closeSentRef.current = true;
-        const close = cloneCue(closingRef.current, "close");
-        inFlightRef.current = true;
-        parkOnAir(close);
-        setStatus("Closing");
-        clientRef.current.say(close.cue);
-      }
-      return;
-    }
-    submitNextRef.current();
-  }, [parkOnAir]);
-
-  advanceQueueRef.current = advanceQueue;
-
   const submitNext = useCallback(() => {
     const client = clientRef.current;
-    if (!client || wrappingRef.current || inFlightRef.current) return;
+    if (!client || aheadRef.current) return;
+    clearTimeout(prefetchTimerRef.current);
+    prefetchTimerRef.current = null;
     if (cuesRef.current.length - indexRef.current <= 1) refillQueue();
     if (indexRef.current >= cuesRef.current.length) {
       const source = archiveRef.current.length ? archiveRef.current : cuesRef.current;
@@ -290,25 +234,23 @@ export default function Studio() {
         cuesRef.current.push(filler);
       }
     }
-    const item = cuesRef.current[indexRef.current];
-    indexRef.current += 1;
-    inFlightRef.current = true;
-    spokenRef.current = false;
-    continuesRef.current = 0;
-    lastTextLenRef.current = 0;
-    parkOnAir(item);
-    setStatus(item.kind === "close" ? "Closing" : `On air · ${item.category_label}`);
-    if (item.kind === "close") {
-      wrappingRef.current = true;
-      closeSentRef.current = true;
+    let item = cuesRef.current[indexRef.current];
+    while (item && item.kind === "close") {
+      indexRef.current += 1;
+      item = cuesRef.current[indexRef.current];
     }
-    client.say(item.cue);
+    if (!item?.cue) return;
+    indexRef.current += 1;
+    aheadRef.current = true;
+    const turnId = client.say(item.cue);
+    turnItemsRef.current.set(turnId, item);
+    setStatus(`On air · ${item.category_label}`);
     clearTimeout(turnTimerRef.current);
-    clearTimeout(prefetchTimerRef.current);
     turnTimerRef.current = setTimeout(() => {
-      advanceQueue(true);
-    }, 45_000);
-  }, [advanceQueue, parkOnAir, refillQueue]);
+      aheadRef.current = false;
+      submitNextRef.current();
+    }, TURN_STALL_MS);
+  }, [refillQueue]);
 
   submitNextRef.current = submitNext;
 
@@ -341,8 +283,7 @@ export default function Studio() {
     (data) => {
       sessionRef.current = data.session.session_id;
       loadQueue(data.briefing);
-      inFlightRef.current = false;
-      spokenRef.current = false;
+      aheadRef.current = false;
       startedRef.current = false;
       mediaReadyRef.current = false;
       const client = new R2Client({
@@ -355,45 +296,36 @@ export default function Studio() {
             tryStartTalking();
           }
           if (msg.type === "turn.text" && d.text) {
-            spokenRef.current = true;
-            lastTextLenRef.current = String(d.text).length;
+            if (d.turn_id) repliesRef.current.set(d.turn_id, d.text);
             setStatus("Anchor speaking");
           }
-          if (msg.type === "turn.started" || msg.type === "turn.visible") {
-            spokenRef.current = true;
-            if (msg.type === "turn.started" && !wrappingRef.current) armSpeechTimers(d.est_ms);
-            if (msg.type === "turn.visible") setStatus("Picture locked");
+          if (msg.type === "turn.visible") {
+            clearTimeout(turnTimerRef.current);
+            aheadRef.current = false;
+            const item = turnItemsRef.current.get(d.turn_id);
+            if (item) parkOnAir(item);
+            setStatus(item ? `On air · ${item.category_label}` : "Picture locked");
+            const spoken = repliesRef.current.get(d.turn_id) || item?.cue || "";
+            clearTimeout(prefetchTimerRef.current);
+            prefetchTimerRef.current = setTimeout(() => {
+              prefetchTimerRef.current = null;
+              submitNextRef.current();
+            }, handoffAfterVisibleMs(spoken));
           }
-          if (msg.type === "usage.tick") {
+          if ((msg.type === "usage.tick" || msg.type === "session.renewed") && d.budget_remaining_ms != null) {
             setBudget(d);
-            if (d.budget_remaining_ms < LOW_BUDGET_MS && !wrappingRef.current) {
-              wrappingRef.current = true;
-            }
           }
           if (msg.type === "media.clip" && d.kind === "idle") {
             if (!startedRef.current) {
               tryStartTalking();
               return;
             }
-            const item = onAirRef.current;
-            const short = lastTextLenRef.current > 0 && lastTextLenRef.current < 320;
-            if (
-              short &&
-              continuesRef.current < 1 &&
-              item?.title &&
-              item.kind !== "close" &&
-              clientRef.current &&
-              !wrappingRef.current
-            ) {
-              continuesRef.current += 1;
-              inFlightRef.current = true;
-              spokenRef.current = false;
-              lastTextLenRef.current = 0;
-              clientRef.current.say(continuationCue(item));
-              armSpeechTimers(0);
-              return;
+            if (aheadRef.current) return;
+            if (prefetchTimerRef.current) {
+              clearTimeout(prefetchTimerRef.current);
+              prefetchTimerRef.current = null;
+              submitNextRef.current();
             }
-            advanceQueue();
           }
         },
         onError: (err) => {
@@ -422,7 +354,7 @@ export default function Studio() {
       setPhase("onair");
       setStatus("Connecting picture");
     },
-    [advanceQueue, armSpeechTimers, loadQueue, submitNext, tryStartTalking]
+    [loadQueue, parkOnAir, submitNext, tryStartTalking]
   );
 
   const join = useCallback(

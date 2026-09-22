@@ -316,20 +316,12 @@ ${body}`.trim();
 }
 
 function renderCue(story, first) {
-  const open = first
-    ? 'One short open, then the item: "You\'re watching WIRE 24. I\'m Elena Voss."'
-    : "Already on air. Do not greet. Start the item on the first word.";
+  const open = first ? "You're watching WIRE 24. I'm Elena Voss. " : "";
   return directorWrap(`
-${open}
-Speak this as one complete news item, six to eight sentences, without stopping.
-1. Say the headline as a spoken lead. Do not stop there.
-2. Expand the report in plain English: who is involved, what happened, and the detail below.
-3. Add two sentences of anchor commentary on why it matters. Interpret only these facts. Do not invent numbers, quotes, or events.
-4. End on a short bridge and keep talking until the commentary is finished. No question. No silence.
+Read the script below in full, every sentence, in one continuous take. Do not shorten it and do not stop after the headline.
+After the script, add two sentences of commentary on why it matters. Use only the facts written here. Do not invent numbers, quotes, or events.
 
-[${story.category_label}] ${story.title}
-${story.summary}
-(${story.source}, ${story.ago})
+${open}${story.title}. ${story.summary} That report is from ${story.source}, ${story.ago}.
 `);
 }
 
