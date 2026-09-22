@@ -68,14 +68,14 @@ test("cues pack stories and stay inside turn.submit length", () => {
     });
   }
   const briefing = assembleBriefing(items, now);
-  assert.ok(briefing.cues.length >= 1);
-  assert.ok(briefing.cues.length < briefing.items.length);
+  assert.equal(briefing.cues.length, briefing.items.length);
   assert.notEqual(briefing.cues.at(-1).kind, "close");
   for (const cue of briefing.cues) {
+    assert.equal(cue.story_ids.length, 1);
     assert.ok(cue.cue.length <= 2000, cue.cue.length);
-    assert.ok(cue.cue.length <= MAX_CUE_CHARS || cue.story_ids.length === 1);
+    assert.ok(cue.cue.length <= MAX_CUE_CHARS);
   }
-  assert.ok(briefing.cues[0].story_ids.length >= 2);
   assert.match(briefing.cues[0].cue, /Headline 1/);
-  assert.match(briefing.cues[0].cue, /Dead air forbidden|back-to-back/i);
+  assert.match(briefing.cues[0].cue, /commentary/i);
+  assert.match(briefing.cues[1].cue, /Headline 2/);
 });

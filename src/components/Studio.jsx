@@ -7,9 +7,7 @@ const HIDDEN_CLOSE_MS = 25_000;
 const LOW_BUDGET_MS = 12_000;
 const REJOIN_MS = 250;
 const PIPELINE_MS = 2800;
-const MIN_LEAD_MS = 1600;
-const TURN_SAFETY_PAD_MS = 12_000;
-const TURN_FALLBACK_MS = 90_000;
+const TURN_SAFETY_FLOOR_MS = 70_000;
 const NEWS_POLL_MS = 45_000;
 
 function viewerMessage(text) {
@@ -24,9 +22,27 @@ function cueKey(cue) {
   return cue?.title || cue?.id || "";
 }
 
-function prefetchDelayMs(estMs) {
-  const est = Number(estMs) > 0 ? Number(estMs) : 22_000;
-  return Math.max(MIN_LEAD_MS, est - PIPELINE_MS);
+function handoffDelayMs(estMs) {
+  const est = Number(estMs);
+  if (!Number.isFinite(est) || est < 18_000) return null;
+  return Math.max(10_000, est - PIPELINE_MS);
+}
+
+function storyCaption(item) {
+  if (!item || item.kind === "close") return "That's the hour on WIRE 24. The wires are still moving.";
+  const summary = String(item.summary || "").trim();
+  return summary ? `${item.title}. ${summary}` : item.title;
+}
+
+function continuationCue(item) {
+  return `[DIRECTOR — silent]
+Live. Dead air forbidden. First word now. No questions. No greeting.
+You stopped too early on this same story. Do not read the headline again.
+Finish it now in four or five sentences: the reported detail, then two sentences of commentary on why it matters. Use only the facts below. Do not invent numbers, quotes, or events.
+
+${item.title}
+${item.summary}
+(${item.source})`.slice(0, 2000);
 }
 
 function speakingQueue(briefing) {
@@ -83,6 +99,9 @@ export default function Studio() {
   const reconnectsRef = useRef(0);
   const turnTimerRef = useRef(null);
   const prefetchTimerRef = useRef(null);
+  const onAirRef = useRef(null);
+  const continuesRef = useRef(0);
+  const lastTextLenRef = useRef(0);
   const hiddenTimerRef = useRef(null);
   const textTimerRef = useRef(null);
   const liveRef = useRef(false);
@@ -100,19 +119,14 @@ export default function Studio() {
   const [briefing, setBriefing] = useState(null);
   const [phase, setPhase] = useState("lobby");
   const [status, setStatus] = useState("Standby");
-  const [caption, setCaption] = useState("");
-  const [currentId, setCurrentId] = useState(null);
+  const [onAir, setOnAir] = useState(null);
   const [fail, setFail] = useState(null);
   const [budget, setBudget] = useState(null);
   const [live, setLive] = useState(false);
 
   const items = briefing?.items || [];
   const stories = storiesOnly(items);
-  const current =
-    (briefing?.cues || []).find((item) => item.id === currentId) ||
-    items.find((item) => item.id === currentId) ||
-    null;
-  const activeIds = activeStoryIds(current, currentId);
+  const activeIds = activeStoryIds(onAir, onAir?.id);
 
   useEffect(() => {
     const tick = setInterval(() => setClock(formatClock(new Date())), 1000);
@@ -214,16 +228,25 @@ export default function Studio() {
   const submitNextRef = useRef(() => {});
   const advanceQueueRef = useRef(() => {});
 
+  const parkOnAir = useCallback((item) => {
+    onAirRef.current = item;
+    setOnAir(item);
+  }, []);
+
   const armSpeechTimers = useCallback((estMs) => {
     clearTimeout(prefetchTimerRef.current);
     clearTimeout(turnTimerRef.current);
-    const est = Math.max(4000, Number(estMs) || 22_000);
-    prefetchTimerRef.current = setTimeout(() => {
-      advanceQueueRef.current();
-    }, prefetchDelayMs(est));
+    const handoff = handoffDelayMs(estMs);
+    if (handoff != null) {
+      prefetchTimerRef.current = setTimeout(() => {
+        advanceQueueRef.current();
+      }, handoff);
+    }
+    const est = Number(estMs);
+    const safety = Math.max(TURN_SAFETY_FLOOR_MS, (Number.isFinite(est) ? est : 0) + 8000);
     turnTimerRef.current = setTimeout(() => {
       advanceQueueRef.current(true);
-    }, est + TURN_SAFETY_PAD_MS);
+    }, safety);
   }, []);
 
   const advanceQueue = useCallback((force = false) => {
@@ -238,14 +261,14 @@ export default function Studio() {
         closeSentRef.current = true;
         const close = cloneCue(closingRef.current, "close");
         inFlightRef.current = true;
-        setCurrentId(close.id);
+        parkOnAir(close);
         setStatus("Closing");
         clientRef.current.say(close.cue);
       }
       return;
     }
     submitNextRef.current();
-  }, []);
+  }, [parkOnAir]);
 
   advanceQueueRef.current = advanceQueue;
 
@@ -271,7 +294,9 @@ export default function Studio() {
     indexRef.current += 1;
     inFlightRef.current = true;
     spokenRef.current = false;
-    setCurrentId(item.id);
+    continuesRef.current = 0;
+    lastTextLenRef.current = 0;
+    parkOnAir(item);
     setStatus(item.kind === "close" ? "Closing" : `On air · ${item.category_label}`);
     if (item.kind === "close") {
       wrappingRef.current = true;
@@ -282,8 +307,8 @@ export default function Studio() {
     clearTimeout(prefetchTimerRef.current);
     turnTimerRef.current = setTimeout(() => {
       advanceQueue(true);
-    }, TURN_FALLBACK_MS);
-  }, [advanceQueue, refillQueue]);
+    }, 45_000);
+  }, [advanceQueue, parkOnAir, refillQueue]);
 
   submitNextRef.current = submitNext;
 
@@ -331,7 +356,7 @@ export default function Studio() {
           }
           if (msg.type === "turn.text" && d.text) {
             spokenRef.current = true;
-            setCaption(d.text);
+            lastTextLenRef.current = String(d.text).length;
             setStatus("Anchor speaking");
           }
           if (msg.type === "turn.started" || msg.type === "turn.visible") {
@@ -348,6 +373,24 @@ export default function Studio() {
           if (msg.type === "media.clip" && d.kind === "idle") {
             if (!startedRef.current) {
               tryStartTalking();
+              return;
+            }
+            const item = onAirRef.current;
+            const short = lastTextLenRef.current > 0 && lastTextLenRef.current < 320;
+            if (
+              short &&
+              continuesRef.current < 1 &&
+              item?.title &&
+              item.kind !== "close" &&
+              clientRef.current &&
+              !wrappingRef.current
+            ) {
+              continuesRef.current += 1;
+              inFlightRef.current = true;
+              spokenRef.current = false;
+              lastTextLenRef.current = 0;
+              clientRef.current.say(continuationCue(item));
+              armSpeechTimers(0);
               return;
             }
             advanceQueue();
@@ -399,8 +442,7 @@ export default function Studio() {
       continueRef.current = true;
       shutdown(isReconnect ? "edition_rollover" : "restart");
       setFail(null);
-      setCaption("");
-      setCurrentId(null);
+      parkOnAir(null);
       setBudget(null);
       setPhase("joining");
       setStatus(isReconnect ? "Next edition…" : "Connecting");
@@ -424,7 +466,7 @@ export default function Studio() {
         joiningRef.current = false;
       }
     },
-    [absorbNews, attachClient, showFail, shutdown]
+    [absorbNews, attachClient, parkOnAir, showFail, shutdown]
   );
 
   joinRef.current = join;
@@ -484,8 +526,7 @@ export default function Studio() {
     shutdown("client_closed");
     setPhase("lobby");
     setStatus("You left the studio");
-    setCaption("");
-    setCurrentId(null);
+    parkOnAir(null);
     setFail(null);
   };
 
@@ -545,19 +586,23 @@ export default function Studio() {
               <span />
             </div>
             <div className="tally">{phase === "onair" && live ? "ON AIR" : "CAM 1"}</div>
-            {current && (
-              <div className={`lower ${current.category || ""}`}>
-                <em>{current.category_label}</em>
+            {onAir && (
+              <div className={`lower ${onAir.category || ""}`}>
+                <em>{onAir.category_label}</em>
                 <div>
-                  <strong>{current.kind === "close" ? "WIRE 24" : current.title}</strong>
-                  <p>{current.kind === "close" ? "Rolling news" : `${current.source} · ${current.ago}`}</p>
+                  <strong>{onAir.kind === "close" ? "WIRE 24" : onAir.title}</strong>
+                  <p>{onAir.kind === "close" ? "Rolling news" : `${onAir.source} · ${onAir.ago}`}</p>
                 </div>
               </div>
             )}
           </div>
           <div className="caption-rail">
-            <span className="rail-kicker">{status}</span>
-            <p>{caption || "The anchor starts talking as soon as the picture is up. No typing required."}</p>
+            <span className="rail-kicker">
+              {onAir && onAir.kind !== "close"
+                ? `${onAir.category_label} · ${onAir.source}`
+                : status}
+            </span>
+            <p>{onAir ? storyCaption(onAir) : "The anchor starts talking as soon as the picture is up. No typing required."}</p>
           </div>
         </section>
 
@@ -588,7 +633,7 @@ export default function Studio() {
             )}
             {remainingSec != null && phase === "onair" && <p className="budget">{remainingSec}s left this hour</p>}
             <p className="fine">
-              Headlines from BBC, NPR, The Guardian, and MarketWatch. The anchor reads title and summary only.
+              Headlines from BBC, NPR, The Guardian, and MarketWatch. Each item is expanded from the source, then given a short comment.
             </p>
           </div>
         </aside>

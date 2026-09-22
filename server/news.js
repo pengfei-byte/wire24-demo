@@ -315,63 +315,52 @@ Live. Dead air forbidden. First word now. No questions. No wait. No re-greeting.
 ${body}`.trim();
 }
 
-function storyLine(story, n) {
-  return `${n}. [${story.category_label}] ${story.title}. ${story.summary} (${story.source}, ${story.ago})`;
-}
-
-function renderCue(group, first) {
-  const lines = group.map((story, n) => storyLine(story, n + 1)).join("\n");
-  const lead = first
-    ? 'Hot camera. One short open: "You\'re watching WIRE 24. I\'m Elena Voss." Then story 1 with no pause.'
-    : "Already on air. Do not greet. Next story in the same breath.";
+function renderCue(story, first) {
+  const open = first
+    ? 'One short open, then the item: "You\'re watching WIRE 24. I\'m Elena Voss."'
+    : "Already on air. Do not greet. Start the item on the first word.";
   return directorWrap(`
-${lead}
-Read every story below back-to-back. Only a breath between them. Do not stop until the last line.
-${lines}
-Natural English. Facts only from the lines above. Keep talking.
+${open}
+Speak this as one complete news item, six to eight sentences, without stopping.
+1. Say the headline as a spoken lead. Do not stop there.
+2. Expand the report in plain English: who is involved, what happened, and the detail below.
+3. Add two sentences of anchor commentary on why it matters. Interpret only these facts. Do not invent numbers, quotes, or events.
+4. End on a short bridge and keep talking until the commentary is finished. No question. No silence.
+
+[${story.category_label}] ${story.title}
+${story.summary}
+(${story.source}, ${story.ago})
 `);
 }
 
-function cueRecord(group, index, cue) {
+function cueRecord(story, index, cue) {
   return {
     id: `block_${index}`,
     kind: "story",
-    category: group[0].category,
-    category_label: group[0].category_label,
-    title: group[0].title,
-    summary: group[0].summary,
-    source: group[0].source,
-    ago: group[0].ago,
-    story_ids: group.map((story) => story.id),
+    category: story.category,
+    category_label: story.category_label,
+    title: story.title,
+    summary: story.summary,
+    source: story.source,
+    ago: story.ago,
+    story_ids: [story.id],
     cue,
   };
 }
 
 export function buildCues(stories) {
   if (!stories.length) return [];
-  const cues = [];
-  let i = 0;
-  while (i < stories.length) {
-    const first = cues.length === 0;
-    const group = [stories[i]];
-    i += 1;
-    while (i < stories.length) {
-      const trial = [...group, stories[i]];
-      if (renderCue(trial, first).length > MAX_CUE_CHARS) break;
-      group.push(stories[i]);
-      i += 1;
-    }
-    let cue = renderCue(group, first);
-    if (cue.length > 2000 && group.length === 1) {
+  return stories.map((story, index) => {
+    let cue = renderCue(story, index === 0);
+    if (cue.length > MAX_CUE_CHARS) {
       const trimmed = {
-        ...group[0],
-        summary: group[0].summary.slice(0, 180).replace(/\s+\S*$/, ""),
+        ...story,
+        summary: story.summary.slice(0, 180).replace(/\s+\S*$/, ""),
       };
-      cue = renderCue([trimmed], first).slice(0, 2000);
+      cue = renderCue(trimmed, index === 0).slice(0, MAX_CUE_CHARS);
     }
-    cues.push(cueRecord(group, cues.length + 1, cue));
-  }
-  return cues;
+    return cueRecord(story, index + 1, cue);
+  });
 }
 
 export function closingCue() {
@@ -403,7 +392,7 @@ export function keepRollingCue() {
     ago: "now",
     story_ids: [],
     cue: directorWrap(`
-Do not go silent. Immediately keep the hour moving: you are still with WIRE 24 rolling news. Recap that politics, business, markets, and entertainment are all live this hour, name that the wires are still updating, and stay on camera talking until this copy is done. No questions. No pause. No holding look.
+Do not go silent. You are still with WIRE 24. In five or six sentences, say the hour is still moving across politics, business, markets, and entertainment, that the wires are still updating, and you are staying with them. No questions. No pause. No holding look.
 `),
   };
 }
